@@ -7,12 +7,17 @@ max_seq_length のブロックに packing し、全トークンを予測対象�
 import argparse
 import json
 import math
+import os
 import random
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()  # .env の WANDB_API_KEY を読み込む
+
 import torch
-from unsloth import FastModel  # noqa: F401  (transformers より先に import する必要がある)
-from transformers import Trainer, TrainingArguments
+from unsloth import FastModel  # noqa: E402,F401  (transformers より先に import する必要がある)
+from transformers import Trainer, TrainingArguments  # noqa: E402
 
 
 def parse_args():
@@ -36,6 +41,10 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=3407)
     ap.add_argument("--val-ratio", type=float, default=0.02)
+    # wandb
+    ap.add_argument("--wandb-project", default="llm-finetune-discord")
+    ap.add_argument("--wandb-run-name", default=None)
+    ap.add_argument("--no-wandb", dest="wandb", action="store_false", default=True)
     return ap.parse_args()
 
 
@@ -70,10 +79,24 @@ def build_blocks(texts, tok, block_size, eos_id):
     return [stream[i : i + block_size] for i in range(0, n, block_size)], len(stream)
 
 
+def setup_wandb(args):
+    """.env の WANDB_API_KEY があれば wandb を有効にする。無ければ黙って無効化。"""
+    if not args.wandb:
+        return False
+    if not os.environ.get("WANDB_API_KEY"):
+        print("WANDB_API_KEY が無いので wandb へのログ送信は無効にします。")
+        return False
+    os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
+    if args.wandb_run_name:
+        os.environ["WANDB_NAME"] = args.wandb_run_name
+    return True
+
+
 def main():
     args = parse_args()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    use_wandb = setup_wandb(args)
 
     model, processor = FastModel.from_pretrained(
         model_name=args.model,
@@ -132,6 +155,29 @@ def main():
                        for n, _ in model.named_parameters() if ".lora_A" in n})
     print("LoRA target modules:", targeted)
 
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if use_wandb:
+        # Trainer より先に run を作っておくと、以下の config も一緒に残せる
+        # (HF の WandbCallback は既存 run があればそれを再利用する)
+        import wandb
+
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                **vars(args),
+                "train_docs": len(train_recs),
+                "val_docs": len(val_recs),
+                "train_tokens": n_train_tok,
+                "val_tokens": n_val_tok,
+                "train_blocks": len(train_blocks),
+                "val_blocks": len(val_blocks),
+                "lora_target_modules": targeted,
+                "trainable_params": n_trainable,
+                "gpu": torch.cuda.get_device_name(0),
+            },
+        )
+
     # ---- train ---------------------------------------------------------------
     targs = TrainingArguments(
         output_dir=str(out_dir / "checkpoints"),
@@ -151,7 +197,8 @@ def main():
         eval_strategy="steps",
         eval_steps=50,
         save_strategy="no",
-        report_to="none",
+        report_to="wandb" if use_wandb else "none",
+        run_name=args.wandb_run_name,
         seed=args.seed,
         remove_unused_columns=False,
         dataloader_num_workers=2,
@@ -195,8 +242,25 @@ def main():
         ),
         encoding="utf-8",
     )
+    peak_vram_gb = torch.cuda.max_memory_reserved() / 1e9
     print(f"saved adapter -> {adapter_dir}")
-    print(f"peak VRAM = {torch.cuda.max_memory_reserved() / 1e9:.1f} GB")
+    print(f"peak VRAM = {peak_vram_gb:.1f} GB")
+
+    if use_wandb:
+        import wandb
+
+        wandb.summary.update(
+            {
+                "eval_loss_before": before["eval_loss"],
+                "eval_loss_after": after["eval_loss"],
+                "ppl_before": math.exp(before["eval_loss"]),
+                "ppl_after": math.exp(after["eval_loss"]),
+                "train_runtime_sec": result.metrics.get("train_runtime"),
+                "peak_vram_gb": peak_vram_gb,
+            }
+        )
+        wandb.save(str(out_dir / "train_summary.json"), base_path=str(out_dir))
+        wandb.finish()
 
 
 if __name__ == "__main__":
