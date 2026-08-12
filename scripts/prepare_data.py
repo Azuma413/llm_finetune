@@ -7,16 +7,16 @@
 import argparse
 import json
 import re
-import unicodedata
+
 from datetime import datetime
 from pathlib import Path
 
 # http(s):// 形式・www. 始まり・スキーム無しの明らかなドメイン付きパス
 URL_RE = re.compile(
     r"""(?ix)
-    \b(?:
+    (?:
         (?:https?|ftp)://[^\s<>"'）」』】]+
-      | www\.[^\s<>"'）」』】]+
+      | \bwww\.[^\s<>"'）」』】]+
     )
     """
 )
@@ -40,9 +40,12 @@ def strip_urls(text: str) -> str:
 
 
 def clean(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
+    # NFKC 正規化はしない: 全角/半角の使い分け (「？」「，」「......」等) は
+    # 転移させたい文体そのものなので原文を保つ。
     text = ZERO_WIDTH_RE.sub("", text)
     text = strip_urls(text)
+    # URL 除去で生じた余分な空白を畳む
+    text = "\n".join(re.sub(r"[ \t　]{2,}", " ", line).strip() for line in text.split("\n"))
     text = TRAILING_WS_RE.sub("", text)
     text = MULTI_BLANK_RE.sub("\n\n", text)
     return text.strip()
